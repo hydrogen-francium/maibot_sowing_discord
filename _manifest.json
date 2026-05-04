@@ -1,0 +1,47 @@
+{
+  "manifest_version": 1,
+  "name": "MaiBot Sowing Discord",
+  "version": "1.0.0",
+  "description": "MaiBot port of astrbot_sowing_discord with keyword + LLM message review.",
+  "author": {
+    "name": "hydrogen-francium",
+    "url": "https://github.com/hydrogen-francium"
+  },
+  "license": "MIT",
+  "homepage_url": "https://github.com/hydrogen-francium/maibot_sowing_discord",
+  "repository_url": "https://github.com/hydrogen-francium/maibot_sowing_discord",
+  "host_application": {
+    "min_version": "0.8.0"
+  },
+  "keywords": [
+    "forward",
+    "group",
+    "history",
+    "migration",
+    "qq",
+    "llm-review"
+  ],
+  "categories": [
+    "Entertainment & Interaction"
+  ],
+  "default_locale": "zh-CN",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "general",
+    "components": [
+      {
+        "type": "event_handler",
+        "name": "sowing_forward_handler",
+        "description": "Cache source-group messages, evaluate via keyword + LLM, then forward."
+      }
+    ],
+    "features": [
+      "source-group candidate cache",
+      "delay window and expiration cleanup",
+      "dynamic cooldown control",
+      "keyword + LLM message review",
+      "NapCat direct forward with MaiBot fallback"
+    ]
+  },
+  "id": "hydrogen-francium.maibot_sowing_discord"
+}

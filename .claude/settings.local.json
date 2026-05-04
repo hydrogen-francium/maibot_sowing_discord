@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(command -v py)",
+      "Bash(command -v python)",
+      "Bash(command -v python3)",
+      "Bash(command -v python.exe)",
+      "Read(//e/cp/maibot/MaiBotOneKey/runtime/**)",
+      "Read(//e/cp/maibot/MaiBotOneKey/**)",
+      "Bash(\"/e/cp/maibot/MaiBotOneKey/python31211/python.exe\" -m py_compile plugin.py)",
+      "Bash(\"/e/cp/maibot/MaiBotOneKey/runtime/python31211/python.exe\" -m py_compile plugin.py)"
+    ]
+  }
+}
