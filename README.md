@@ -20,9 +20,10 @@
   - `always`:不审核,全部放行(调试用)。
 - **双路转发**:
   - 优先调 NapCat HTTP `forward_group_single_msg`,原消息原样转(保留合并转发结构、表情、回复等元信息)。
-  - 失败/未启用时回退到 MaiBot `send_forward()`,先尝试 message_id 引用方式让 adapter 原样合并转发,再次失败才用手动构造的节点兜底。
-- **消息类型白名单**:默认只入队 `image` 和 `forward`,纯文本不进缓存,从源头节省 LLM 调用。
-- **图片描述展开**:LLM 审核时会自动把消息里的 `[picid:xxx]` 替换为 MaiBot 数据库里已有的图片描述,审核更准。
+  - 失败/未启用时只回退到可重建的 MaiBot `send_forward()` 节点；不再使用 message_id 引用兜底。
+- **引用合并消息过滤**:普通消息如果只是回复/引用了一条合并转发,会被当作普通评论拒绝入队；合并转发内部嵌套合并转发仍然是正常内容。
+- **消息类型白名单**:默认只入队 `forward`,图片和纯文本不进缓存,从源头节省 LLM 调用并避开不稳定图片链路。
+- **图片描述展开**:默认关闭。当前审核只面向合并转发文本上下文，不再把图片描述作为放行依据。
 - **`block_source_messages`**:开启后源群命中的消息会被本插件拦截(`intercept_message=True`),不会再触达 LLM 主流程,避免麦麦自己回复源群里的史。
 
 ---
@@ -36,7 +37,7 @@
 | 依赖社区互动 | 是(没人贴表情就没法判定) | 否 |
 | 转发实现 | NapCat `forward_group_single_msg` | 同上,失败后回退 MaiBot `send_forward()` |
 | 缓存与冷却 | LocalCache + `banshi_cooldown_*` | RuntimeState (JSON) + `cooldown.*` |
-| 消息类型过滤 | `allowed_message_types` | 同名,默认收紧为 `["image", "forward"]` |
+| 消息类型过滤 | `allowed_message_types` | 同名,默认收紧为 `["forward"]` |
 | 配置版本化 | 无 | 走 MaiBot config_version 迁移 |
 
 > MaiBot 没有"贴表情评分"对应的社区行为,原插件依赖的好评/差评表情数据拿不到,所以重新设计了 LLM 审核作为替代。如果你的部署里有别的方法采集消息热度,也可以仿着 `MessageEvaluator` 添加新策略。
@@ -93,13 +94,14 @@ maibot_sowing_discord/
 | `night_seconds` | `3600` | 夜间冷却。 |
 | `day_start` | `09:00` | 白天起始时间,24 小时制。 |
 | `night_start` | `01:00` | 夜间起始时间。 |
+| `min_seconds` | `0` | 全局冷却下限,单位秒。实际冷却 = `max(动态冷却, min_seconds)`。设 0 时不生效;设大值用于一刀切兜底,避免白天冷却被设得太短。 |
 
 判定区间:`now ≥ day_start` 或 `now < night_start` 视为白天,其余视为夜间。即默认 `09:00–次日 01:00` 白天,`01:00–09:00` 夜间。
 
 ### `[filter]`
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `allowed_message_types` | `["image", "forward"]` | 允许入队的消息类型。可选:`text` / `image` / `emoji` / `voice` / `video` / `forward`。**消息中包含未授权的核心媒体类型(`image` / `voice` / `video` / `forward`)时整条消息会被拒绝。** |
+| `allowed_message_types` | `["forward"]` | 允许入队的消息类型。默认只支持合并转发；图片消息不再支持。**消息中包含未授权的核心媒体类型(`image` / `voice` / `video` / `forward`)时整条消息会被拒绝。** |
 | `block_source_messages` | `false` | 开启后,命中源群的消息会在本插件处终止后续 EventHandler(防止麦麦在源群里被史触发回复)。需要 `intercept_message=True` 才生效——已默认开启。 |
 
 ### `[evaluation]`
@@ -123,9 +125,9 @@ maibot_sowing_discord/
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否启用 LLM 审核。 |
-| `message_types` | `["image", "forward"]` | 允许进入 LLM 审核的消息类型,其它类型会被跳过。 |
+| `message_types` | `["forward"]` | 允许进入 LLM 审核的消息类型,其它类型会被跳过。 |
 | `only_forward_messages` | `false` | 旧兼容开关,仅 `message_types` 留空时才生效。 |
-| `expand_picid_descriptions` | `true` | 是否把 `[picid:xxx]` 展开成 MaiBot 数据库里现成的图片描述,再交给关键词和 LLM。 |
+| `expand_picid_descriptions` | `false` | 是否把 `[picid:xxx]` 展开成 MaiBot 数据库里现成的图片描述。图片消息不再支持，默认关闭。 |
 | `prompt_template` | (见下) | LLM 审核提示词模板。占位符仅识别 `{name}` 形式,JSON 字面量花括号会被原样保留。 |
 | `reject_keywords` | `[]` | 命中即直接拒绝,优先级高于 LLM。 |
 | `pass_keywords` | `[]` | 命中即直接放行,优先级高于 LLM 和 reject_keywords。 |
@@ -143,13 +145,11 @@ maibot_sowing_discord/
 
 #### 默认 prompt 策略
 
-默认模板按优先级把审核分成 4 档:
+默认模板按优先级把审核分成 3 档:
 
-- **P0 一票否决**:政治议题(无论立场/玩梗/二创)、明显违法违规——立即 reject。
-- **P1 NSFW 分级**:明显 NSFW 直接 reject;轻微擦边仅当过 P2 整活门槛才 allow。
-- **P2 图片整活门槛**(`contains_image=true`):普通图片(风景、自拍、日常、产品图、二次元立绘无梗等)即使无害也 reject;只有梗图、抽象/迫真/戏谑、沙雕/鬼畜/二创搞笑、合并转发里的整活段才 allow。判定不准时一律 reject。
-- **P3 合并转发**:默认放宽(玩梗/低质段子/抽象对话可 allow);P0/P1 命中照样 reject;毫无节目效果(纯客套/通知/求助/认真讨论/吵架)reject。
-- **P4 其他**:纯文本倾向 reject(本插件主服务图片/合并转发搬运)。
+- **P0 一票否决**:政治议题(无论立场/玩梗/二创)、明显违法违规、明显 NSFW 或色情引流——立即 reject。
+- **P1 输入边界**:只审核当前消息本体是合并转发的消息；回复/引用某条合并转发后的普通评论 reject；单独图片搬运不支持。
+- **P2 合并转发放行标准**:玩梗、抽象对话、低质段子、明确节目效果可 allow；纯通知/求助/认真讨论/吵架/无上下文普通聊天 reject；无法判断时 reject。
 
 要换风格直接改 `prompt_template`(toml 里是单行字符串)。注意保留所有 `{name}` 占位符。
 
@@ -162,8 +162,8 @@ maibot_sowing_discord/
 | `{message_id}` | 真实 QQ message_id |
 | `{plain_text}` / `{raw_message}` | 文本内容 / 原 CQ 码 |
 | `{current_message}` | `plain_text` 优先,否则 `raw_message` |
-| `{content_types}` | 例如 `image, text` 或 `forward` |
-| `{contains_image}` / `{contains_forward}` | `true` / `false` |
+| `{content_types}` | 例如 `forward` 或 `forward, text` |
+| `{contains_forward}` | `true` / `false` |
 | `{reply_segments}` | JSON 序列化后的段列表 |
 | `{history}` | 最近聊天记录(已格式化) |
 
@@ -188,6 +188,9 @@ _resolve_source_info  ←  从 chat_stream.context.get_last_message 取真实 me
 _extract_content_types  ←  遍历 message.message_segments 按 Seg.type 识别
   │
   ▼
+普通评论引用合并转发 → 按 text 拒绝入队
+  │
+  ▼
 _is_allowed_message  →  filter.allowed_message_types 检查
   │
   ▼
@@ -207,8 +210,7 @@ get_matured(wait_seconds) → 冷却检查 → MessageEvaluator.evaluate
     NapCat forward_group_single_msg                remove_pending
               │
               └→ 失败回退 MaiBot send_forward
-                    ├→ message_id 引用 (保真)
-                    └→ 失败再回退手动构造节点
+                    └→ 仅发送可重建节点,不使用 message_id 引用
               │
               ▼
         set_last_forward_at  →  动态冷却开始
@@ -222,9 +224,9 @@ get_matured(wait_seconds) → 冷却检查 → MessageEvaluator.evaluate
 
 把 `cache.wait_seconds=30, evaluation.strategy="always", napcat_http.use_direct_forward=false` 临时调小,5 分钟内能看到效果。
 
-源群发图片应当看到:
+源群发合并转发应当看到:
 ```
-[maibot_sowing_discord] cached message <真实 QQ id> from group <群号> types=['image']
+[maibot_sowing_discord] cached message <真实 QQ id> from group <群号> types=['forward']
 [maibot_sowing_discord] background worker started, poll_interval=30s
 ...
 [maibot_sowing_discord] forwarded message <id> to N target streams

@@ -326,7 +326,7 @@ class MessageEvaluator:
             return [item.lower() for item in configured]
         if bool(plugin.get_config("llm_review.only_forward_messages", False)):
             return ["forward"]
-        return ["image", "forward"]
+        return ["forward"]
 
     @staticmethod
     def _build_review_text(message: PendingMessage, plugin: BaseEventHandler) -> str:
@@ -338,7 +338,7 @@ class MessageEvaluator:
     def _expand_picid_descriptions(content: str, plugin: BaseEventHandler) -> str:
         if not content:
             return ""
-        if not bool(plugin.get_config("llm_review.expand_picid_descriptions", True)):
+        if not bool(plugin.get_config("llm_review.expand_picid_descriptions", False)):
             return content
         if not hasattr(message_api, "translate_pid_to_description"):
             return content
@@ -570,12 +570,12 @@ class SowingForwardHandler(BaseEventHandler):
     def _get_dynamic_cooldown(self) -> int:
         day_seconds = int(self.get_config("cooldown.day_seconds", 600))
         night_seconds = int(self.get_config("cooldown.night_seconds", 3600))
+        min_seconds = int(self.get_config("cooldown.min_seconds", 0))
         day_start = self._parse_time(str(self.get_config("cooldown.day_start", "09:00")), dtime(9, 0))
         night_start = self._parse_time(str(self.get_config("cooldown.night_start", "01:00")), dtime(1, 0))
         now = datetime.now().time()
-        if now >= day_start or now < night_start:
-            return day_seconds
-        return night_seconds
+        dynamic = day_seconds if (now >= day_start or now < night_start) else night_seconds
+        return max(dynamic, max(min_seconds, 0))
 
     def _resolve_source_info(self, message: MaiMessages) -> Dict[str, Any]:
         stream_id = str(getattr(message, "stream_id", "") or "")
@@ -656,8 +656,6 @@ class SowingForwardHandler(BaseEventHandler):
             seg_data = getattr(seg, "data", None)
 
             if seg_type == "seglist":
-                # MaiBot 把合并转发(forward)展开成 seglist
-                collected.append("forward")
                 if isinstance(seg_data, list):
                     for child in seg_data:
                         visit(child)
@@ -716,6 +714,15 @@ class SowingForwardHandler(BaseEventHandler):
 
         return segments
 
+    def _is_comment_on_forward_message(self, plain_text: str) -> bool:
+        text = plain_text.strip()
+        return (
+            text.startswith("[回复<")
+            and "转发消息开始" in text
+            and "转发消息结束" in text
+            and "]，说：" in text
+        )
+
     def _build_pending_message(self, message: MaiMessages, source_info: Dict[str, Any]) -> Optional[PendingMessage]:
         stream_id = str(source_info["stream_id"])
         group_id = str(source_info["group_id"])
@@ -726,6 +733,10 @@ class SowingForwardHandler(BaseEventHandler):
         user_nickname = str(source_info["user_nickname"]) or str(source_info["user_id"]) or "unknown"
         content_types = self._extract_content_types(message)
         plain_text = str(getattr(message, "plain_text", "") or "")
+        if self._is_comment_on_forward_message(plain_text):
+            logger.debug(f"[{PLUGIN_NAME}] skip quoted forward comment {message_id}")
+            content_types = [item for item in content_types if item != "forward"] or ["text"]
+
         raw_message = str(getattr(message, "raw_message", "") or "")
         if not bool(self.get_config("cache.keep_raw_message", False)):
             raw_message = raw_message if (not plain_text and "forward" in content_types) else ""
@@ -745,7 +756,7 @@ class SowingForwardHandler(BaseEventHandler):
         )
 
     def _is_allowed_message(self, pending: PendingMessage) -> bool:
-        allowed = set(self._normalize_list(self.get_config("filter.allowed_message_types", ["image", "forward"])))
+        allowed = set(self._normalize_list(self.get_config("filter.allowed_message_types", ["forward"])))
         if not allowed:
             return False
 
@@ -914,10 +925,10 @@ class SowingForwardHandler(BaseEventHandler):
                     )
                     return
 
-                # MaiBot 兜底:优先用 message_id 引用方式让 adapter 原样合并转发,失败再回退到手动构造节点
+                # MaiBot 兜底只发送可重建的节点。不要用 message_id 引用原消息，否则合并消息会变成
+                # “引用合并消息的合并转发”，并且在 message_id 回查偏移时会转发到引用消息本身。
                 sender_id = pending.user_id or "0"
                 sender_name = pending.user_nickname or sender_id
-                id_reference_payload: List[Any] = [pending.message_id]
                 manual_payload: List[Any] = (
                     [(sender_id, sender_name, reply_payload)] if reply_payload else []
                 )
@@ -935,16 +946,20 @@ class SowingForwardHandler(BaseEventHandler):
                         return False
 
                 success_count = 0
-                for target_stream_id in target_stream_ids:
-                    success = await _try_send(target_stream_id, id_reference_payload)
-                    if not success and manual_payload:
+                if manual_payload:
+                    for target_stream_id in target_stream_ids:
                         success = await _try_send(target_stream_id, manual_payload)
-                    if success:
-                        success_count += 1
-                    else:
-                        logger.error(
-                            f"[{PLUGIN_NAME}] failed to forward message {pending.message_id} to stream {target_stream_id}"
-                        )
+                        if success:
+                            success_count += 1
+                        else:
+                            logger.error(
+                                f"[{PLUGIN_NAME}] failed to forward message {pending.message_id} to stream {target_stream_id}"
+                            )
+                else:
+                    logger.error(
+                        f"[{PLUGIN_NAME}] message {pending.message_id} has no manual fallback payload; "
+                        f"keep pending for next NapCat direct-forward attempt"
+                    )
 
                 if success_count > 0:
                     await self.state.remove_pending(pending.message_id)
@@ -987,9 +1002,9 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.4.0",
+                default="1.5.0",
                 description="配置文件版本。修改 config_schema 后应同步提升版本，便于 MaiBot 执行配置迁移。",
-                example="1.4.0",
+                example="1.5.0",
             ),
         },
         "source": {
@@ -1072,14 +1087,21 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
                 description="夜间开始时间，24 小时制，格式 HH:MM。与 day_start 共同定义冷热却区间切换。",
                 example="01:00",
             ),
+            "min_seconds": ConfigField(
+                type=int,
+                default=0,
+                description="全局冷却下限,单位秒。无论白天/夜间,实际冷却 = max(动态冷却, 这个值)。设为 0 时不生效。用于在 day/night 之外再压一层全局上限。",
+                min=0,
+                example="1800",
+            ),
         },
         "filter": {
             "allowed_message_types": ConfigField(
                 type=list,
-                default=["image", "forward"],
-                description='允许进入候选池的消息类型。默认仅接收 `image` 和 `forward`，这样更符合当前审核策略，也更省资源。若消息包含未授权的核心媒体类型，会被整条拦截。',
+                default=["forward"],
+                description='允许进入候选池的消息类型。默认仅接收 `forward`；图片消息不再支持。若消息包含未授权的核心媒体类型，会被整条拦截。',
                 item_type="string",
-                example='["image", "forward"]',
+                example='["forward"]',
             ),
             "block_source_messages": ConfigField(
                 type=bool,
@@ -1159,10 +1181,10 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             ),
             "message_types": ConfigField(
                 type=list,
-                default=["image", "forward"],
-                description="允许进入 LLM 审核的消息类型列表。默认只审图片和合并转发，普通文本不会触发 LLM。",
+                default=["forward"],
+                description="允许进入 LLM 审核的消息类型列表。默认只审合并转发；图片消息不再支持。",
                 item_type="string",
-                example='["image", "forward"]',
+                example='["forward"]',
             ),
             "only_forward_messages": ConfigField(
                 type=bool,
@@ -1172,19 +1194,18 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             ),
             "expand_picid_descriptions": ConfigField(
                 type=bool,
-                default=True,
-                description="是否把消息里的 `[picid:xxx]` 替换为 MaiBot 数据库中已存在的图片描述，再交给关键词和 LLM 审核。只能利用已有描述，拿不到描述时会保留为普通图片占位。",
-                example="true",
+                default=False,
+                description="是否把消息里的 `[picid:xxx]` 替换为 MaiBot 数据库中已存在的图片描述。图片消息不再支持，默认关闭。",
+                example="false",
             ),
             "prompt_template": ConfigField(
                 type=str,
                 default=(
                     "# Role\n"
-                    "你是一个严格的群消息搬运审核器,只负责判断这条消息是否值得搬到目标群作为节目效果消息。\n\n"
+                    "你是一个严格的群合并转发搬运审核器,只判断当前合并转发是否值得搬到目标群作为节目效果消息。\n\n"
                     "# Context\n"
                     "当前消息来自群 {group_id},发送者 {user_nickname}({user_id}),消息ID={message_id}。\n"
                     "消息类型:{content_types}\n"
-                    "是否包含图片:{contains_image}\n"
                     "是否包含合并转发:{contains_forward}\n\n"
                     "# Current Message\n"
                     "plain_text:\n{plain_text}\n\n"
@@ -1195,33 +1216,23 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
                     "# Core Policy (按优先级)\n\n"
                     "## P0 一票否决,任何场景立即 reject\n"
                     "1. 政治内容:涉及国家领导人、政府政策、敏感历史事件、政治立场表态、地缘政治、社会运动、民族宗教冲突、领土争议等任何形式的政治议题,无论立场、无论玩梗、无论二创,一律 reject,不解释。\n"
-                    "2. 明显违法违规:真实违法犯罪记录、人肉开盒、儿童色情、暴恐血腥、自残教唆、毒品交易。\n\n"
-                    "## P1 NSFW 分级\n"
-                    "- 明显 NSFW (露点、性器官、性行为画面、成人视频引流、约炮广告、色情网站): reject。\n"
-                    "- 轻微擦边 (泳装、低胸、暧昧姿势但无露点、二次元擦边但不暴露、性暗示玩梗): 仅当同时满足下面 P2 整活门槛时才 allow,否则 reject。\n"
-                    "- 合并转发整体被色情主题主导时整体 reject;混杂一两条擦边梗可放行。\n\n"
-                    "## P2 图片整活门槛 (contains_image=true 时按这条审核)\n"
-                    "**普通图片即使完全无害也 reject。**包括:风景照、自拍、日常照、宠物照、美食照、产品图、纯文字截图、二次元立绘但无梗、网红/明星照、漂亮但平淡的图。\n"
-                    "只有满足下列至少一条才 allow:\n"
-                    "- 明显是梗图、段子图、表情包(带梗那种,不是普通可爱图)\n"
-                    "- 抽象、迫真、戏谑、玩梗、整活的视觉冲击图\n"
-                    "- 沙雕、鬼畜、二创搞笑、阴间整活、出乎意料的反差\n"
-                    "- 合并转发里至少有一段是上述类型的整活内容\n"
-                    "- 本群最近聊天记录(history)能佐证图片是在配合玩梗、有上下文笑点\n"
-                    "判定不准时一律 reject,宁可错杀。\n\n"
-                    "## P3 合并转发标准 (contains_forward=true)\n"
-                    "- 默认放宽:玩梗、轻度冒犯、低质段子、普通争论、抽象对话可 allow\n"
-                    "- 但 P0/P1 命中照样 reject\n"
-                    "- 整体毫无节目效果的转发(纯客套、纯通知、纯求助、纯认真讨论、纯吵架骂战)reject\n\n"
-                    "## P4 其他\n"
-                    "- 纯文本消息倾向 reject (本插件服务于图片/合并转发搬运,纯文字进来一般是误入)\n"
-                    "- 文本里没有现成图片描述时不要臆测图片内容,但已有描述指向 P0/P1 风险时直接 reject\n\n"
+                    "2. 明显违法违规:真实违法犯罪记录、人肉开盒、儿童色情、暴恐血腥、自残教唆、毒品交易。\n"
+                    "3. 明显 NSFW 或色情引流:露点、性器官、性行为、成人视频、约炮广告、色情网站等直接 reject。\n\n"
+                    "## P1 输入边界\n"
+                    "- 只审核当前消息本体是合并转发的消息。若 contains_forward=false,或内容明显只是回复/引用某条合并转发后的普通评论,一律 reject。\n"
+                    "- 不支持单独图片搬运。不要根据图片占位符、图片数量或无法确认的图片内容作 allow 判断。\n"
+                    "- 如果合并转发主要由图片占位符构成,且没有足够文字上下文证明节目效果,一律 reject。\n\n"
+                    "## P2 合并转发放行标准\n"
+                    "- allow:玩梗、抽象对话、低质段子、轻度冒犯但无实质风险、群友互动产生的明确节目效果。\n"
+                    "- allow:最近聊天记录能佐证该合并转发有上下文笑点。\n"
+                    "- reject:纯通知、纯求助、纯认真讨论、纯吵架骂战、纯客套、无上下文的普通聊天记录。\n"
+                    "- reject:无法判断笑点或节目效果时一律 reject。\n\n"
                     "# Output\n"
                     "只输出一个 JSON 对象,不要输出任何额外文字:\n"
                     "{\"decision\":\"allow|reject\",\"reason\":\"不超过40字\"}"
                 ),
                 description="LLM 审核提示词模板。必须只要求模型输出 JSON,字段至少包含 decision 和 reason。占位符仅识别 {name} 形式,JSON 字面量花括号会被原样保留。",
-                example='{"decision":"allow","reason":"梗图有效"}',
+                example='{"decision":"allow","reason":"合并转发有节目效果"}',
             ),
             "reject_keywords": ConfigField(
                 type=list,
