@@ -647,6 +647,13 @@ class SowingForwardHandler(BaseEventHandler):
         }
 
     def _extract_content_types(self, message: MaiMessages) -> List[str]:
+        """识别消息的内容类型。
+
+        关键约束:只有当 segments 里直接出现 ``Seg(type="forward")`` 才认作合并转发。
+        引用合并消息的普通评论(segments 是 ``[Seg(reply, ...), Seg(text, ...)]``,
+        plain_text 被 MaiBot 渲染成 ``[回复<...转发消息开始...转发消息结束...]，说：xxx``)
+        不会进入 forward 路径,避免被误送进搬运队列。
+        """
         collected: List[str] = []
 
         def visit(seg: Any) -> None:
@@ -655,13 +662,18 @@ class SowingForwardHandler(BaseEventHandler):
             seg_type = str(getattr(seg, "type", "") or "").lower()
             seg_data = getattr(seg, "data", None)
 
+            if seg_type == "forward":
+                # maim_message 协议里 forward 段 data 是节点列表,这才是真合并转发
+                collected.append("forward")
+                return
             if seg_type == "seglist":
+                # 内嵌 seglist 不当 forward,递归看里面具体段
                 if isinstance(seg_data, list):
                     for child in seg_data:
                         visit(child)
                 return
-            if seg_type == "forward":
-                collected.append("forward")
+            if seg_type == "reply":
+                # 引用段,不算正文类型,直接跳过
                 return
             if seg_type in {"image", "emoji", "voice", "video", "audio", "file"}:
                 collected.append(seg_type)
@@ -681,6 +693,14 @@ class SowingForwardHandler(BaseEventHandler):
             plain_text = str(getattr(message, "plain_text", "") or "").strip()
             raw_message = str(getattr(message, "raw_message", "") or "").strip()
             if plain_text or raw_message:
+                collected.append("text")
+
+        # 二重护栏:即使 adapter 把"引用合并转发的评论"渲染成了 forward 段,
+        # 只要 plain_text 是 ``[回复<...转发消息开始...转发消息结束...]，说：xxx`` 这个模式,降级为 text
+        plain_text_for_check = str(getattr(message, "plain_text", "") or "")
+        if "forward" in collected and self._is_comment_on_forward_message(plain_text_for_check):
+            collected = [t for t in collected if t != "forward"]
+            if not collected:
                 collected.append("text")
 
         return sorted(set(collected))
@@ -925,10 +945,11 @@ class SowingForwardHandler(BaseEventHandler):
                     )
                     return
 
-                # MaiBot 兜底只发送可重建的节点。不要用 message_id 引用原消息，否则合并消息会变成
-                # “引用合并消息的合并转发”，并且在 message_id 回查偏移时会转发到引用消息本身。
+                # MaiBot 兜底:优先用 message_id 引用方式让 adapter 原样合并转发,失败再回退到手动构造节点。
+                # 引用合并消息的评论已经在 _extract_content_types 处被剔除,此处不会拿到 fake forward。
                 sender_id = pending.user_id or "0"
                 sender_name = pending.user_nickname or sender_id
+                id_reference_payload: List[Any] = [pending.message_id]
                 manual_payload: List[Any] = (
                     [(sender_id, sender_name, reply_payload)] if reply_payload else []
                 )
@@ -946,20 +967,16 @@ class SowingForwardHandler(BaseEventHandler):
                         return False
 
                 success_count = 0
-                if manual_payload:
-                    for target_stream_id in target_stream_ids:
+                for target_stream_id in target_stream_ids:
+                    success = await _try_send(target_stream_id, id_reference_payload)
+                    if not success and manual_payload:
                         success = await _try_send(target_stream_id, manual_payload)
-                        if success:
-                            success_count += 1
-                        else:
-                            logger.error(
-                                f"[{PLUGIN_NAME}] failed to forward message {pending.message_id} to stream {target_stream_id}"
-                            )
-                else:
-                    logger.error(
-                        f"[{PLUGIN_NAME}] message {pending.message_id} has no manual fallback payload; "
-                        f"keep pending for next NapCat direct-forward attempt"
-                    )
+                    if success:
+                        success_count += 1
+                    else:
+                        logger.error(
+                            f"[{PLUGIN_NAME}] failed to forward message {pending.message_id} to stream {target_stream_id}"
+                        )
 
                 if success_count > 0:
                     await self.state.remove_pending(pending.message_id)
