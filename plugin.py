@@ -649,10 +649,13 @@ class SowingForwardHandler(BaseEventHandler):
     def _extract_content_types(self, message: MaiMessages) -> List[str]:
         """识别消息的内容类型。
 
-        关键约束:只有当 segments 里直接出现 ``Seg(type="forward")`` 才认作合并转发。
-        引用合并消息的普通评论(segments 是 ``[Seg(reply, ...), Seg(text, ...)]``,
-        plain_text 被 MaiBot 渲染成 ``[回复<...转发消息开始...转发消息结束...]，说：xxx``)
-        不会进入 forward 路径,避免被误送进搬运队列。
+        关键约束:在 MaiBot-Napcat-Adapter 下,合并转发会被预渲染成
+        ``Seg(type="seglist", data=[<text "===转发消息开始==">, ..., <text "===转发消息结束==">])``,
+        ``type="forward"`` 段被消化掉,无法直接判定。所以用 plain_text 里
+        ``========== 转发消息开始 ==========`` 标记 + 不是``[回复<...]``评论模式来识别。
+
+        引用合并消息的普通评论(plain_text 形如 ``[回复<...转发消息开始...转发消息结束...]，说：xxx``)
+        不应该被认作 forward,会进入搬运队列。
         """
         collected: List[str] = []
 
@@ -663,11 +666,11 @@ class SowingForwardHandler(BaseEventHandler):
             seg_data = getattr(seg, "data", None)
 
             if seg_type == "forward":
-                # maim_message 协议里 forward 段 data 是节点列表,这才是真合并转发
+                # 协议层就是 forward 段;少见但留着以防 adapter 改变行为
                 collected.append("forward")
                 return
             if seg_type == "seglist":
-                # 内嵌 seglist 不当 forward,递归看里面具体段
+                # 内嵌 seglist 不直接当 forward,递归看具体段
                 if isinstance(seg_data, list):
                     for child in seg_data:
                         visit(child)
@@ -690,15 +693,21 @@ class SowingForwardHandler(BaseEventHandler):
             visit(seg)
 
         if not collected:
-            plain_text = str(getattr(message, "plain_text", "") or "").strip()
-            raw_message = str(getattr(message, "raw_message", "") or "").strip()
-            if plain_text or raw_message:
+            plain_text_init = str(getattr(message, "plain_text", "") or "").strip()
+            raw_message_init = str(getattr(message, "raw_message", "") or "").strip()
+            if plain_text_init or raw_message_init:
                 collected.append("text")
 
-        # 二重护栏:即使 adapter 把"引用合并转发的评论"渲染成了 forward 段,
-        # 只要 plain_text 是 ``[回复<...转发消息开始...转发消息结束...]，说：xxx`` 这个模式,降级为 text
+        # MaiBot-Napcat-Adapter 把合并转发展开成 seglist + 文本头尾,看 marker 反推。
         plain_text_for_check = str(getattr(message, "plain_text", "") or "")
-        if "forward" in collected and self._is_comment_on_forward_message(plain_text_for_check):
+        is_quote_comment = self._is_comment_on_forward_message(plain_text_for_check)
+        napcat_forward_marker = "转发消息开始"
+        if napcat_forward_marker in plain_text_for_check and not is_quote_comment:
+            if "forward" not in collected:
+                collected.append("forward")
+
+        # 二重护栏:adapter 哪天保留了真 forward 段,但 plain_text 又是评论模式 -> 降级
+        if "forward" in collected and is_quote_comment:
             collected = [t for t in collected if t != "forward"]
             if not collected:
                 collected.append("text")
