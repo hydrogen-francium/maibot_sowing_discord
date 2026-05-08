@@ -699,12 +699,14 @@ class SowingForwardHandler(BaseEventHandler):
                 collected.append("text")
 
         # MaiBot-Napcat-Adapter 把合并转发展开成 seglist + 文本头尾,看 marker 反推。
+        # 命中时整条消息就是一个合并转发包,内部 text/image 是包内内容而非消息本身的
+        # 多媒体类型——必须 collapse 成 ["forward"],否则 _is_allowed_message 的
+        # protected_types 检查会因内部 image 把整个合并转发拒掉。
         plain_text_for_check = str(getattr(message, "plain_text", "") or "")
         is_quote_comment = self._is_comment_on_forward_message(plain_text_for_check)
         napcat_forward_marker = "转发消息开始"
         if napcat_forward_marker in plain_text_for_check and not is_quote_comment:
-            if "forward" not in collected:
-                collected.append("forward")
+            return ["forward"]
 
         # 二重护栏:adapter 哪天保留了真 forward 段,但 plain_text 又是评论模式 -> 降级
         if "forward" in collected and is_quote_comment:
