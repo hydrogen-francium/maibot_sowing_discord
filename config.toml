@@ -20,7 +20,6 @@ config_version = "1.5.0"
 # 示例: ["123456789", "987654321"]
 group_ids = [
     "1081895328",
-    "668903036",
     "774169604",
     "1065361498",
     "624563959",
@@ -160,9 +159,7 @@ enabled = true
 
 # 允许进入 LLM 审核的消息类型列表。默认只审合并转发，普通文本和图片不会触发 LLM。
 # 示例: ["forward"]
-message_types = [
-    "forward",
-]
+message_types = ["forward"]
 
 # 旧兼容开关。仅当 `llm_review.message_types` 留空时才生效；设为 true 时等价于只审 `forward`。
 # 示例: false
@@ -174,7 +171,7 @@ expand_picid_descriptions = false
 
 # LLM 审核提示词模板。必须只要求模型输出 JSON，字段至少包含 decision 和 reason。
 # 示例: {"decision":"allow","reason":"有节目效果"}
-prompt_template = "# Role 你是一个严格的群合并转发搬运审核器,只判断当前合并转发是否值得搬到目标群作为节目效果消息。  # Context 当前消息来自群 {group_id},发送者 {user_nickname}({user_id}),消息ID={message_id}。 消息类型:{content_types} 是否包含合并转发:{contains_forward}  # Current Message plain_text: {plain_text}  raw_message: {raw_message}  reply_segments: {reply_segments}  # Recent Chat History {history}  # Core Policy (按优先级)  ## P0 一票否决,任何场景立即 reject 1. 政治内容:涉及国家领导人、政府政策、敏感历史事件、政治立场表态、地缘政治、社会运动、民族宗教冲突、领土争议等任何形式的政治议题,无论立场、无论玩梗、无论二创,一律 reject,不解释。 2. 明显违法违规:真实违法犯罪记录、人肉开盒、儿童色情、暴恐血腥、自残教唆、毒品交易。 3. 明显 NSFW 或色情引流:露点、性器官、性行为、成人视频、约炮广告、色情网站等直接 reject。  ## P1 输入边界 - 只审核当前消息本体是合并转发的消息。若 contains_forward=false,或内容明显只是回复/引用某条合并转发后的普通评论,一律 reject。 - 不支持单独图片搬运。不要根据图片占位符、图片数量或无法确认的图片内容作 allow 判断。 - 如果合并转发主要由图片占位符构成,且没有足够文字上下文证明节目效果,一律 reject。  ## P2 合并转发放行标准 - allow:玩梗、抽象对话、低质段子、轻度冒犯但无实质风险、群友互动产生的明确节目效果。 - allow:最近聊天记录能佐证该合并转发有上下文笑点。 - reject:纯通知、纯求助、纯认真讨论、纯吵架骂战、纯客套、无上下文的普通聊天记录。 - reject:无法判断笑点或节目效果时一律 reject。  # Output 只输出一个 JSON 对象,不要输出任何额外文字: {\"decision\":\"allow|reject\",\"reason\":\"不超过40字\"} "
+prompt_template = "# Role 你是一个严格的群合并转发搬运审核器,只判断当前合并转发是否值得搬到目标群作为节目效果消息。  # Context 当前消息来自群 {group_id},发送者 {user_nickname}({user_id}),消息ID={message_id}。 消息类型:{content_types} 是否包含合并转发:{contains_forward}  # Current Message plain_text: {plain_text}  raw_message: {raw_message}  reply_segments: {reply_segments}  # Recent Chat History {history}  # Core Policy (按优先级)  ## P0 一票否决,任何场景立即 reject 1. 政治内容:涉及国家领导人、政府政策、敏感历史事件、政治立场表态、地缘政治、社会运动、民族宗教冲突、领土争议等任何形式的政治议题,无论立场、无论玩梗、无论二创,一律 reject,不解释。 2. 明显违法违规:真实违法犯罪记录、人肉开盒、儿童色情、暴恐血腥、自残教唆、毒品交易。 3. 明显 NSFW 或色情引流:露点、性器官、性行为、成人视频、约炮广告、色情网站等直接 reject。  ## P1 输入边界 - 只审核当前消息本体是合并转发的消息。若 contains_forward=false,或内容明显只是回复/引用某条合并转发后的普通评论,一律 reject。 - 不支持单独图片搬运。不要根据图片占位符、图片数量或无法确认的图片内容作 allow 判断。 - 如果合并转发主要由图片占位符构成,且没有足够文字上下文证明节目效果,一律 reject。  ## P2 合并转发放行标准 - allow:玩梗、抽象对话、低质段子、轻度冒犯但无实质风险、群友互动产生的明确节目效果。 - allow:合并转发内容自成一体,脱离 Recent Chat History 仍能看懂笑点。 - reject:合并转发内容与 Recent Chat History 有强关联,必须依赖上文语境才能理解(如接续上文话题、回应上文提问、延续上文讨论)。我们只搬完整的梗,不搬只在特定语境下才有意义的聊天片段。 - reject:纯通知、纯求助、纯认真讨论、纯吵架骂战、纯客套、无上下文的普通聊天记录。 - reject:无法判断笑点或节目效果时一律 reject。  # Output 只输出一个 JSON 对象,不要输出任何额外文字: {\"decision\":\"allow|reject\",\"reason\":\"不超过40字\"} "
 
 # 命中即直接拒绝转发的关键词列表。优先级高于 LLM。
 # 示例: ["广告", "引流", "nsfw"]
@@ -194,11 +191,11 @@ pass_keywords = []
 
 # 审核时向消息库回看最近多少小时的聊天记录。
 # 示例: 12
-history_hours = 12
+history_hours = 20
 
 # 审核时最多带入多少条最近聊天记录。默认值已下调，减少内存和上下文占用。
 # 示例: 12
-history_limit = 12
+history_limit = 20
 
 # 构建聊天记录时是否过滤 bot 自己的消息。
 # 示例: false
