@@ -730,10 +730,21 @@ class SowingForwardHandler(BaseEventHandler):
                     walk(child)
                 return
 
-            if seg_type in {"text", "image", "emoji"} and isinstance(seg_data, str):
-                if seg_type == "text" and not seg_data.strip():
+            if seg_type == "text" and isinstance(seg_data, str):
+                if not seg_data.strip():
                     return
-                segments.append((seg_type, seg_data))
+                segments.append(("text", seg_data))
+                return
+
+            # image/emoji 段的 data 是 base64（可达几 MB），LLM 也无法据此判断节目效果
+            # （prompt 已声明不根据图片内容作 allow 判断），存占位符即可，
+            # 防止整段 base64 被 json.dumps 塞进 prompt 把 LLM 网关撑爆。
+            if seg_type == "image":
+                segments.append(("image", "[image]"))
+                return
+            if seg_type == "emoji":
+                segments.append(("emoji", "[emoji]"))
+                return
 
         for seg in getattr(message, "message_segments", None) or []:
             walk(seg)
