@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "MaiBot Sowing Discord",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MaiBot port of astrbot_sowing_discord with keyword + LLM message review.",
   "author": {
     "name": "hydrogen-francium",
@@ -32,15 +32,20 @@
       {
         "type": "event_handler",
         "name": "sowing_forward_handler",
-        "description": "Cache source-group messages, evaluate via keyword + LLM, then forward."
+        "description": "Persist source-group forwards, review them, and deliver per target."
+      },
+      {
+        "type": "event_handler",
+        "name": "sowing_startup_handler",
+        "description": "Resume unfinished SQLite jobs after MaiBot starts."
       }
     ],
     "features": [
-      "source-group candidate cache",
-      "delay window and expiration cleanup",
-      "dynamic cooldown control",
-      "keyword + LLM message review",
-      "NapCat direct forward with MaiBot fallback"
+      "SQLite-backed source-group candidate queue",
+      "structured keyword + LLM review with existing image descriptions",
+      "per-target deduplication, cooldown, delivery, and retry",
+      "NapCat direct forward with per-target MaiBot fallback",
+      "ActionRecord context for follow-up conversations"
     ]
   },
   "id": "hydrogen-francium.maibot_sowing_discord"

@@ -1,5 +1,8 @@
-# 运行时状态(每次启动都会重新创建/更新)
+# 运行时状态
 runtime_state.json
+sowing_state.sqlite3
+sowing_state.sqlite3-shm
+sowing_state.sqlite3-wal
 
 # MaiBot 配置自动备份
 config.toml.backup.*

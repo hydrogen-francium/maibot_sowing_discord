@@ -1,8 +1,13 @@
 import asyncio
+import hashlib
+import difflib
 import json
 import os
 import re
+import sqlite3
 import time
+import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from urllib import error as urllib_error
@@ -18,8 +23,8 @@ from src.plugin_system import (
     ConfigField,
     EventType,
     MaiMessages,
-    ReplyContentType,
     chat_api,
+    database_api,
     get_logger,
     llm_api,
     message_api,
@@ -30,6 +35,39 @@ from src.plugin_system import (
 
 PLUGIN_NAME = "maibot_sowing_discord"
 logger = get_logger(PLUGIN_NAME)
+
+
+def normalize_content_text(value: Any) -> str:
+    """生成跨 adapter 格式稳定的去重文本。"""
+    value = unicodedata.normalize("NFKC", str(value or "")).replace("\r\n", "\n")
+    value = re.sub(r"={3,}\s*转发消息(?:开始|结束)\s*={3,}", "", value)
+    value = re.sub(r"https?://\S+", "[url]", value)
+    return re.sub(r"\s+", " ", value).strip().lower()
+
+
+def build_content_fingerprint(text: str, segments: List[Tuple[str, str]]) -> str:
+    """Hash durable snapshot data only; never include timestamps, URLs, or base64."""
+    media = []
+    for kind, value in segments:
+        if kind in {"image", "emoji", "video", "file", "voice", "audio"}:
+            value = str(value or "")
+            # identifiers/descriptions are useful; transport payloads are not.
+            if len(value) > 300 or value.startswith(("data:", "http://", "https://")):
+                value = f"[{kind}]"
+            media.append((kind, normalize_content_text(value)))
+    payload = json.dumps({"text": normalize_content_text(text), "media": media},
+                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def content_similarity(left: str, right: str) -> float:
+    left, right = normalize_content_text(left), normalize_content_text(right)
+    if not left or not right:
+        return 0.0
+    seq = difflib.SequenceMatcher(None, left, right).ratio()
+    words_a, words_b = set(left.split()), set(right.split())
+    jaccard = len(words_a & words_b) / len(words_a | words_b) if words_a or words_b else 0.0
+    return max(seq, jaccard)
 
 
 @dataclass
@@ -87,96 +125,222 @@ class EvaluationResult:
     should_forward: bool
     is_final: bool
     reason: str = ""
+    analysis: Optional[Dict[str, Any]] = None
 
 
 class RuntimeState:
-    def __init__(self) -> None:
+    """SQLite-backed durable queue.  Legacy runtime_state.json is deliberately not imported."""
+
+    def __init__(self, state_path: Optional[str] = None) -> None:
         self._lock = asyncio.Lock()
-        self._state_path = os.path.join(self._get_plugin_dir(), "runtime_state.json")
-        self._ensure_file()
-
-    def _get_plugin_dir(self) -> str:
         try:
-            plugin_dir = plugin_manage_api.get_plugin_path(PLUGIN_NAME)
-            if plugin_dir:
-                return plugin_dir
+            base = plugin_manage_api.get_plugin_path(PLUGIN_NAME) or os.path.dirname(os.path.abspath(__file__))
         except Exception:
-            pass
-        return os.path.dirname(os.path.abspath(__file__))
+            base = os.path.dirname(os.path.abspath(__file__))
+        self._state_path = state_path or os.path.join(base, "sowing_state.sqlite3")
+        self._init_db()
+        legacy = os.path.join(base, "runtime_state.json")
+        if state_path is None and os.path.exists(legacy):
+            logger.warning(f"[{PLUGIN_NAME}] legacy runtime_state.json was not migrated; SQLite starts empty")
 
-    def _ensure_file(self) -> None:
-        os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
-        if not os.path.exists(self._state_path):
-            with open(self._state_path, "w", encoding="utf-8") as file:
-                json.dump({"pending": [], "last_forward_at": 0.0}, file, ensure_ascii=False)
-
-    def _read_state_unlocked(self) -> Dict[str, Any]:
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self._state_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
-            with open(self._state_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {"pending": [], "last_forward_at": 0.0}
-        data.setdefault("pending", [])
-        data.setdefault("last_forward_at", 0.0)
-        return data
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
-    def _write_state_unlocked(self, state: Dict[str, Any]) -> None:
-        with open(self._state_path, "w", encoding="utf-8") as file:
-            json.dump(state, file, ensure_ascii=False, indent=2)
+    def _init_db(self) -> None:
+        with self._connect() as db:
+            db.executescript("""
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, stream_id TEXT NOT NULL,
+                source_group_id TEXT NOT NULL, platform TEXT NOT NULL, user_id TEXT, nickname TEXT,
+                payload_json TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                analysis_json TEXT, created_at REAL NOT NULL, due_at REAL NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL NOT NULL DEFAULT 0, last_error TEXT,
+                UNIQUE(message_id, stream_id));
+            CREATE TABLE IF NOT EXISTS deliveries (
+                id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, target_stream_id TEXT NOT NULL DEFAULT '',
+                target_group_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0, last_error TEXT, completed_at REAL, sending_started_at REAL,
+                UNIQUE(job_id, target_group_id), FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS content_history (
+                target_stream_id TEXT NOT NULL, fingerprint TEXT NOT NULL, normalized_text TEXT NOT NULL,
+                sent_at REAL NOT NULL, source_group_id TEXT, summary TEXT,
+                PRIMARY KEY(target_stream_id, fingerprint));
+            CREATE TABLE IF NOT EXISTS cooldowns (target_stream_id TEXT PRIMARY KEY, last_success_at REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS jobs_due ON jobs(status, due_at, next_retry_at);
+            CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, next_retry_at);
+            """)
+            delivery_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(deliveries)").fetchall()
+            }
+            if "sending_started_at" not in delivery_columns:
+                db.execute("ALTER TABLE deliveries ADD COLUMN sending_started_at REAL")
 
-    async def cleanup(self, max_age_seconds: int) -> int:
+    async def _run(self, operation, *args):
         async with self._lock:
-            state = self._read_state_unlocked()
+            return await asyncio.to_thread(operation, *args)
+
+    async def cleanup(self, max_age_seconds: int, history_retention_days: int = 30) -> int:
+        def op():
             now = time.time()
-            original_count = len(state["pending"])
-            state["pending"] = [
-                item
-                for item in state["pending"]
-                if now - float(item.get("cached_at", 0.0)) <= max_age_seconds
-            ]
-            removed_count = original_count - len(state["pending"])
-            if removed_count > 0:
-                self._write_state_unlocked(state)
-            return removed_count
+            with self._connect() as db:
+                result = db.execute("UPDATE jobs SET status='expired' WHERE status IN ('pending','retry') AND created_at<?", (now - max_age_seconds,))
+                db.execute(
+                    "UPDATE deliveries SET status='retry',next_retry_at=?,last_error='recovered expired sending lease' "
+                    "WHERE status='sending' AND sending_started_at<?",
+                    (now, now - 300),
+                )
+                db.execute("DELETE FROM content_history WHERE sent_at<?", (now - max(1, history_retention_days) * 86400,))
+                db.execute("DELETE FROM jobs WHERE status IN ('completed','rejected','failed','expired') AND created_at<?", (now - max(1, history_retention_days) * 86400,))
+                return result.rowcount
+        return await self._run(op)
 
-    async def add_pending(self, message: PendingMessage) -> None:
-        async with self._lock:
-            state = self._read_state_unlocked()
-            pending: List[Dict[str, Any]] = state["pending"]
-            pending = [item for item in pending if str(item.get("message_id", "")) != message.message_id]
-            pending.append(message.to_dict())
-            pending.sort(key=lambda item: float(item.get("cached_at", 0.0)))
-            state["pending"] = pending
-            self._write_state_unlocked(state)
-
-    async def remove_pending(self, message_id: str) -> None:
-        async with self._lock:
-            state = self._read_state_unlocked()
-            state["pending"] = [
-                item for item in state["pending"] if str(item.get("message_id", "")) != str(message_id)
-            ]
-            self._write_state_unlocked(state)
-
-    async def get_matured(self, wait_seconds: int) -> List[PendingMessage]:
-        async with self._lock:
-            state = self._read_state_unlocked()
+    async def add_pending(self, message: PendingMessage, wait_seconds: int) -> None:
+        def op():
             now = time.time()
-            matured: List[PendingMessage] = []
-            for item in state["pending"]:
-                if now - float(item.get("cached_at", 0.0)) >= wait_seconds:
-                    matured.append(PendingMessage.from_dict(item))
-            return matured
+            due_at = message.cached_at + max(0, wait_seconds)
+            payload = message.to_dict()
+            fingerprint = build_content_fingerprint(message.plain_text or message.raw_message, message.reply_segments)
+            with self._connect() as db:
+                db.execute("""INSERT INTO jobs(message_id,stream_id,source_group_id,platform,user_id,nickname,payload_json,fingerprint,created_at,due_at,next_retry_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(message_id,stream_id) DO NOTHING""",
+                    (message.message_id,message.stream_id,message.group_id,message.platform,message.user_id,message.user_nickname,
+                     json.dumps(payload,ensure_ascii=False),fingerprint,now,due_at,now))
+        await self._run(op)
 
-    async def get_last_forward_at(self) -> float:
-        async with self._lock:
-            state = self._read_state_unlocked()
-            return float(state.get("last_forward_at", 0.0))
+    async def get_matured(self, limit: int = 20) -> List[PendingMessage]:
+        def op():
+            now=time.time()
+            with self._connect() as db:
+                rows=db.execute("SELECT payload_json FROM jobs WHERE status IN ('pending','retry') AND due_at<=? AND next_retry_at<=? ORDER BY created_at LIMIT ?",(now,now,max(1,limit))).fetchall()
+                return [PendingMessage.from_dict(json.loads(row[0])) for row in rows]
+        return await self._run(op)
 
-    async def set_last_forward_at(self, timestamp: float) -> None:
-        async with self._lock:
-            state = self._read_state_unlocked()
-            state["last_forward_at"] = timestamp
-            self._write_state_unlocked(state)
+    async def finalize_evaluation(
+        self,
+        message: PendingMessage,
+        result: EvaluationResult,
+        targets: List[Tuple[str, str]],
+    ) -> None:
+        def op():
+            analysis = result.analysis or {
+                "decision": "allow" if result.should_forward else "reject",
+                "reason": result.reason,
+                "summary": "",
+                "joke_points": [],
+                "context_dependency": "unknown",
+                "content_tags": [],
+                "risk_tags": [],
+            }
+            status = "approved" if result.should_forward else "rejected"
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT id FROM jobs WHERE message_id=? AND stream_id=?",
+                    (message.message_id, message.stream_id),
+                ).fetchone()
+                if not row:
+                    return
+                if result.should_forward and not targets:
+                    raise RuntimeError("approved message has no eligible targets")
+                if result.should_forward:
+                    db.executemany(
+                        "INSERT INTO deliveries(job_id,target_stream_id,target_group_id) VALUES(?,?,?) "
+                        "ON CONFLICT(job_id,target_group_id) DO UPDATE SET target_stream_id=excluded.target_stream_id",
+                        [(row[0], stream_id, group_id) for stream_id, group_id in targets],
+                    )
+                db.execute(
+                    "UPDATE jobs SET status=?,analysis_json=?,last_error=NULL WHERE id=?",
+                    (status, json.dumps(analysis, ensure_ascii=False), row[0]),
+                )
+        await self._run(op)
+
+    async def retry_job(self, message: PendingMessage, reason: str, delay: int, maximum: int) -> None:
+        def op():
+            with self._connect() as db:
+                db.execute("UPDATE jobs SET retry_count=retry_count+1,status=CASE WHEN retry_count+1>=? THEN 'failed' ELSE 'retry' END,next_retry_at=?,last_error=? WHERE message_id=? AND stream_id=?",(maximum,time.time()+delay,reason[:500],message.message_id,message.stream_id))
+        await self._run(op)
+
+    async def due_deliveries(self, limit: int = 20) -> List[Dict[str,Any]]:
+        def op():
+            with self._connect() as db:
+                rows=db.execute("""SELECT d.*,j.message_id,j.source_group_id,j.platform,j.user_id,j.nickname,j.payload_json,j.fingerprint,j.analysis_json
+                    FROM deliveries d JOIN jobs j ON d.job_id=j.id WHERE d.status IN ('pending','retry') AND d.next_retry_at<=? AND j.status='approved' ORDER BY d.id LIMIT ?""",(time.time(),max(1,limit))).fetchall()
+                return [dict(row) for row in rows]
+        return await self._run(op)
+
+    async def claim_delivery(self, delivery_id: int) -> bool:
+        def op():
+            with self._connect() as db:
+                result = db.execute(
+                    "UPDATE deliveries SET status='sending',sending_started_at=? "
+                    "WHERE id=? AND status IN ('pending','retry') AND next_retry_at<=?",
+                    (time.time(), delivery_id, time.time()),
+                )
+                return result.rowcount == 1
+        return await self._run(op)
+
+    async def duplicate(self,target: str,fingerprint: str) -> bool:
+        def op():
+            with self._connect() as db: return bool(db.execute("SELECT 1 FROM content_history WHERE target_stream_id=? AND fingerprint=?",(target,fingerprint)).fetchone())
+        return await self._run(op)
+
+    async def history(self,target: str,limit: int) -> List[str]:
+        def op():
+            with self._connect() as db: return [r[0] for r in db.execute("SELECT normalized_text FROM content_history WHERE target_stream_id=? ORDER BY sent_at DESC LIMIT ?",(target,limit)).fetchall()]
+        return await self._run(op)
+
+    async def cooling_remaining(self, target: str, seconds: int) -> float:
+        def op():
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT last_success_at FROM cooldowns WHERE target_stream_id=?",
+                    (target,),
+                ).fetchone()
+                if not row:
+                    return 0.0
+                return max(0.0, seconds - (time.time() - float(row[0])))
+        return await self._run(op)
+
+    async def defer_delivery(self, delivery_id: int, delay: float) -> None:
+        def op():
+            with self._connect() as db:
+                db.execute(
+                    "UPDATE deliveries SET status='retry',next_retry_at=?,sending_started_at=NULL "
+                    "WHERE id=? AND status='sending'",
+                    (time.time() + max(1.0, delay), delivery_id),
+                )
+        await self._run(op)
+
+    async def complete_delivery(self, delivery_id: int, state: str, payload: PendingMessage, fingerprint: str, summary: str="") -> None:
+        def op():
+            now=time.time()
+            with self._connect() as db:
+                db.execute("UPDATE deliveries SET status=?,completed_at=?,last_error=NULL,sending_started_at=NULL WHERE id=?",(state,now,delivery_id))
+                if state == "sent":
+                    target_row=db.execute("SELECT target_stream_id,target_group_id FROM deliveries WHERE id=?",(delivery_id,)).fetchone()
+                    target=target_row[0] or f"group:{target_row[1]}"
+                    db.execute("INSERT OR IGNORE INTO content_history VALUES(?,?,?,?,?,?)",(target,fingerprint,normalize_content_text(payload.plain_text),now,payload.group_id,summary))
+                    db.execute("INSERT INTO cooldowns VALUES(?,?) ON CONFLICT(target_stream_id) DO UPDATE SET last_success_at=excluded.last_success_at",(target,now))
+                db.execute("UPDATE jobs SET status='completed' WHERE id=(SELECT job_id FROM deliveries WHERE id=?) AND NOT EXISTS(SELECT 1 FROM deliveries WHERE job_id=(SELECT job_id FROM deliveries WHERE id=?) AND status IN ('pending','retry'))",(delivery_id,delivery_id))
+        await self._run(op)
+
+    async def retry_delivery(self,delivery_id: int,reason: str,delay: int,maximum: int) -> None:
+        def op():
+            with self._connect() as db:
+                db.execute("UPDATE deliveries SET retry_count=retry_count+1,status=CASE WHEN retry_count+1>=? THEN 'failed' ELSE 'retry' END,next_retry_at=?,last_error=?,sending_started_at=NULL WHERE id=?",(maximum,time.time()+delay,reason[:500],delivery_id))
+                db.execute("UPDATE jobs SET status='completed' WHERE id=(SELECT job_id FROM deliveries WHERE id=?) AND NOT EXISTS(SELECT 1 FROM deliveries WHERE job_id=(SELECT job_id FROM deliveries WHERE id=?) AND status IN ('pending','retry'))",(delivery_id,delivery_id))
+        await self._run(op)
 
 
 class MessageEvaluator:
@@ -191,7 +355,12 @@ class MessageEvaluator:
         plugin: BaseEventHandler,
     ) -> EvaluationResult:
         if strategy == "always":
-            return EvaluationResult(True, True, "strategy=always")
+            return EvaluationResult(
+                True,
+                True,
+                "strategy=always",
+                MessageEvaluator._minimal_analysis("allow", "strategy=always"),
+            )
 
         if strategy == "keyword_llm":
             return await MessageEvaluator._evaluate_keyword_llm(message, case_sensitive, plugin)
@@ -205,9 +374,23 @@ class MessageEvaluator:
             keywords = [keyword.lower() for keyword in keywords]
 
         if strategy == "keyword_any":
-            return EvaluationResult(any(keyword in haystack for keyword in keywords), True, "strategy=keyword_any")
+            allowed = any(keyword in haystack for keyword in keywords)
+            reason = "strategy=keyword_any"
+            return EvaluationResult(
+                allowed,
+                True,
+                reason,
+                MessageEvaluator._minimal_analysis("allow" if allowed else "reject", reason),
+            )
         if strategy == "keyword_all":
-            return EvaluationResult(all(keyword in haystack for keyword in keywords), True, "strategy=keyword_all")
+            allowed = all(keyword in haystack for keyword in keywords)
+            reason = "strategy=keyword_all"
+            return EvaluationResult(
+                allowed,
+                True,
+                reason,
+                MessageEvaluator._minimal_analysis("allow" if allowed else "reject", reason),
+            )
         return EvaluationResult(False, True, f"unknown strategy: {strategy}")
 
     @staticmethod
@@ -233,20 +416,23 @@ class MessageEvaluator:
         text_to_match = MessageEvaluator._build_review_text(message, plugin)
         normalized_text = text_to_match if case_sensitive else text_to_match.lower()
 
+        # Safety denylist is authoritative even if a pass keyword also matches.
+        matched_reject = [
+            keyword for keyword in reject_keywords
+            if (keyword if case_sensitive else keyword.lower()) in normalized_text
+        ]
+        if matched_reject:
+            reason = f"matched reject keywords: {', '.join(matched_reject[:5])}"
+            return EvaluationResult(False, True, reason, MessageEvaluator._minimal_analysis("reject", reason))
+
         if pass_keywords:
             matched_pass = [
                 keyword for keyword in pass_keywords
                 if (keyword if case_sensitive else keyword.lower()) in normalized_text
             ]
             if matched_pass:
-                return EvaluationResult(True, True, f"matched pass keywords: {', '.join(matched_pass[:5])}")
-
-        matched_reject = [
-            keyword for keyword in reject_keywords
-            if (keyword if case_sensitive else keyword.lower()) in normalized_text
-        ]
-        if matched_reject:
-            return EvaluationResult(False, True, f"matched reject keywords: {', '.join(matched_reject[:5])}")
+                reason = f"matched pass keywords: {', '.join(matched_pass[:5])}"
+                return EvaluationResult(True, True, reason, MessageEvaluator._minimal_analysis("allow", reason))
 
         try:
             history = MessageEvaluator._build_recent_history(message, plugin)
@@ -308,10 +494,22 @@ class MessageEvaluator:
         decision = str(parsed.get("decision", "")).strip().lower()
         reason = str(parsed.get("reason", "")).strip()
         if decision == "allow":
-            return EvaluationResult(True, True, f"keyword_llm allow via {model_name}: {reason}")
+            return EvaluationResult(True, True, f"keyword_llm allow via {model_name}: {reason}", parsed)
         if decision == "reject":
-            return EvaluationResult(False, True, f"keyword_llm reject via {model_name}: {reason}")
+            return EvaluationResult(False, True, f"keyword_llm reject via {model_name}: {reason}", parsed)
         return EvaluationResult(False, False, f"llm review returned invalid decision: {decision}")
+
+    @staticmethod
+    def _minimal_analysis(decision: str, reason: str) -> Dict[str, Any]:
+        return {
+            "decision": decision,
+            "reason": reason,
+            "summary": "",
+            "joke_points": [],
+            "context_dependency": "unknown",
+            "content_tags": [],
+            "risk_tags": [],
+        }
 
     @staticmethod
     def _normalize_keywords(value: Any) -> List[str]:
@@ -338,7 +536,7 @@ class MessageEvaluator:
     def _expand_picid_descriptions(content: str, plugin: BaseEventHandler) -> str:
         if not content:
             return ""
-        if not bool(plugin.get_config("llm_review.expand_picid_descriptions", False)):
+        if not bool(plugin.get_config("media.describe_picid", True)):
             return content
         if not hasattr(message_api, "translate_pid_to_description"):
             return content
@@ -425,18 +623,39 @@ class MessageEvaluator:
             return None
         try:
             parsed = json.loads(response)
-            return parsed if isinstance(parsed, dict) else None
+            if not isinstance(parsed, dict):
+                return None
         except json.JSONDecodeError:
-            pass
-
-        match = re.search(r"\{[\s\S]*\}", response)
-        if not match:
-            return None
-        try:
-            parsed = json.loads(match.group(0))
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            return None
+            decoder = json.JSONDecoder()
+            parsed = None
+            for match in re.finditer(r"\{", response):
+                try:
+                    candidate, _ = decoder.raw_decode(response[match.start():])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(candidate, dict):
+                    parsed = candidate
+                    break
+            if parsed is None:
+                return None
+        # Keep the complete analysis contract even when a model omits optional
+        # fields, so keyword and LLM decisions have one downstream shape.
+        parsed["decision"] = str(parsed.get("decision", "")).strip().lower()
+        parsed["reason"] = str(parsed.get("reason", "")).strip()
+        parsed.setdefault("summary", "")
+        parsed.setdefault("joke_points", [])
+        parsed.setdefault("context_dependency", "unknown")
+        parsed.setdefault("content_tags", [])
+        parsed.setdefault("risk_tags", [])
+        for key in ("joke_points", "content_tags", "risk_tags"):
+            if not isinstance(parsed[key], list):
+                parsed[key] = [str(parsed[key])] if parsed[key] else []
+        dependency = parsed.get("context_dependency", "unknown")
+        if isinstance(dependency, bool):
+            dependency = "high" if dependency else "none"
+        dependency = str(dependency).strip().lower()
+        parsed["context_dependency"] = dependency if dependency in {"none", "low", "high", "unknown"} else "unknown"
+        return parsed
 
 
 class NapCatHttpClient:
@@ -500,6 +719,9 @@ class SowingForwardHandler(BaseEventHandler):
     handler_name = "sowing_forward_handler"
     handler_description = "Cache source-group messages and forward them after evaluation."
     intercept_message = True
+    _shared_background_task: Optional[asyncio.Task] = None
+    _shared_worker_owner: Optional["SowingForwardHandler"] = None
+    _shared_worker_guard: Optional[asyncio.Lock] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -507,6 +729,9 @@ class SowingForwardHandler(BaseEventHandler):
         self.process_lock = asyncio.Lock()
         self.napcat = NapCatHttpClient(self)
         self.background_task: Optional[asyncio.Task] = None
+        self.llm_semaphore = asyncio.Semaphore(2)
+        self.delivery_semaphore = asyncio.Semaphore(4)
+        self.target_locks: Dict[str, asyncio.Lock] = {}
 
     async def execute(self, message: MaiMessages | None) -> Tuple[bool, bool, Optional[str], None, None]:
         if not message:
@@ -523,11 +748,14 @@ class SowingForwardHandler(BaseEventHandler):
         is_source_group = source_info["group_id"] in source_group_ids
         should_continue = not (is_source_group and self.get_config("filter.block_source_messages", False))
 
-        cleaned = await self.state.cleanup(int(self.get_config("cache.max_age_seconds", 3600)))
+        cleaned = await self.state.cleanup(
+            int(self.get_config("cache.max_age_seconds", 3600)),
+            int(self.get_config("dedup.record_retention_days", 30)),
+        )
         if cleaned > 0:
             logger.info(f"[{PLUGIN_NAME}] cleaned {cleaned} expired pending messages")
 
-        self._ensure_background_worker()
+        await self._ensure_background_worker()
 
         if is_source_group:
             pending = self._build_pending_message(message, source_info)
@@ -544,7 +772,10 @@ class SowingForwardHandler(BaseEventHandler):
                     f"content_types={pending.content_types} not allowed"
                 )
             else:
-                await self.state.add_pending(pending)
+                await self.state.add_pending(
+                    pending,
+                    int(self.get_config("cache.wait_seconds", 600)),
+                )
                 logger.info(
                     f"[{PLUGIN_NAME}] cached message {pending.message_id} from group {pending.group_id} "
                     f"types={pending.content_types}"
@@ -703,9 +934,12 @@ class SowingForwardHandler(BaseEventHandler):
         # 多媒体类型——必须 collapse 成 ["forward"],否则 _is_allowed_message 的
         # protected_types 检查会因内部 image 把整个合并转发拒掉。
         plain_text_for_check = str(getattr(message, "plain_text", "") or "")
+        raw_text_for_check = str(getattr(message, "raw_message", "") or "")
         is_quote_comment = self._is_comment_on_forward_message(plain_text_for_check)
         napcat_forward_marker = "转发消息开始"
-        if napcat_forward_marker in plain_text_for_check and not is_quote_comment:
+        # NapCat normally exposes a seglist plus marker.  Do not require a
+        # top-level ``forward`` segment: adapters consume it before plugins run.
+        if (napcat_forward_marker in plain_text_for_check or napcat_forward_marker in raw_text_for_check) and not is_quote_comment:
             return ["forward"]
 
         # 二重护栏:adapter 哪天保留了真 forward 段,但 plain_text 又是评论模式 -> 降级
@@ -736,14 +970,22 @@ class SowingForwardHandler(BaseEventHandler):
                 segments.append(("text", seg_data))
                 return
 
-            # image/emoji 段的 data 是 base64（可达几 MB），LLM 也无法据此判断节目效果
-            # （prompt 已声明不根据图片内容作 allow 判断），存占位符即可，
-            # 防止整段 base64 被 json.dumps 塞进 prompt 把 LLM 网关撑爆。
-            if seg_type == "image":
-                segments.append(("image", "[image]"))
+            if seg_type in {"image", "emoji"}:
+                pic_match = MessageEvaluator.PIC_ID_PATTERN.search(str(seg_data or ""))
+                if pic_match and bool(self.get_config("media.describe_picid", True)):
+                    content = MessageEvaluator._expand_picid_descriptions(pic_match.group(0), self)
+                    segments.append((seg_type, content or f"[{seg_type}]"))
+                else:
+                    segments.append((seg_type, f"[{seg_type}]"))
                 return
-            if seg_type == "emoji":
-                segments.append(("emoji", "[emoji]"))
+            if seg_type in {"video", "file", "voice", "audio"}:
+                metadata: Dict[str, Any] = {}
+                if isinstance(seg_data, dict):
+                    for key in ("name", "file", "file_id", "size", "duration", "mime", "type"):
+                        value = seg_data.get(key)
+                        if value not in (None, ""):
+                            metadata[key] = str(value)[:160]
+                segments.append((seg_type, json.dumps(metadata, ensure_ascii=False, sort_keys=True) if metadata else f"[{seg_type}]"))
                 return
 
         for seg in getattr(message, "message_segments", None) or []:
@@ -831,6 +1073,13 @@ class SowingForwardHandler(BaseEventHandler):
                 stream_ids.append(stream_id)
         return stream_ids
 
+    def _group_id_for_stream(self, stream_id: str, platform: str) -> str:
+        for stream in chat_api.get_group_streams(platform):
+            stream_info = chat_api.get_stream_info(stream)
+            if str(stream_info.get("stream_id", "")) == str(stream_id):
+                return str(stream_info.get("group_id", "") or "")
+        return ""
+
     def _resolve_target_group_ids(self) -> List[str]:
         return self._normalize_list(self.get_config("target.group_ids", []))
 
@@ -851,20 +1100,20 @@ class SowingForwardHandler(BaseEventHandler):
             filtered.append(stream_id)
         return filtered
 
-    def _to_reply_content(self, segment_type: str) -> Optional[ReplyContentType]:
-        mapping = {
-            "text": ReplyContentType.TEXT,
-            "image": ReplyContentType.IMAGE,
-            "emoji": ReplyContentType.EMOJI,
-        }
-        return mapping.get(segment_type)
-
-    def _ensure_background_worker(self) -> None:
+    async def _ensure_background_worker(self) -> None:
         if not bool(self.get_config("cache.process_in_background", True)):
             return
-        if self.background_task and not self.background_task.done():
-            return
-        self.background_task = asyncio.create_task(self._background_process_loop())
+        if SowingForwardHandler._shared_worker_guard is None:
+            SowingForwardHandler._shared_worker_guard = asyncio.Lock()
+        async with SowingForwardHandler._shared_worker_guard:
+            task = SowingForwardHandler._shared_background_task
+            if task and not task.done():
+                self.background_task = task
+                return
+            SowingForwardHandler._shared_worker_owner = self
+            task = asyncio.create_task(self._background_process_loop())
+            SowingForwardHandler._shared_background_task = task
+            self.background_task = task
 
     async def _background_process_loop(self) -> None:
         poll_seconds = max(1, int(self.get_config("cache.poll_interval_seconds", 30)))
@@ -872,7 +1121,10 @@ class SowingForwardHandler(BaseEventHandler):
         try:
             while True:
                 try:
-                    cleaned = await self.state.cleanup(int(self.get_config("cache.max_age_seconds", 3600)))
+                    cleaned = await self.state.cleanup(
+                        int(self.get_config("cache.max_age_seconds", 3600)),
+                        int(self.get_config("dedup.record_retention_days", 30)),
+                    )
                     if cleaned > 0:
                         logger.info(f"[{PLUGIN_NAME}] cleaned {cleaned} expired pending messages")
                     await self._process_pending()
@@ -882,133 +1134,219 @@ class SowingForwardHandler(BaseEventHandler):
         except asyncio.CancelledError:
             logger.info(f"[{PLUGIN_NAME}] background worker stopped")
             raise
+        finally:
+            current = asyncio.current_task()
+            if SowingForwardHandler._shared_background_task is current:
+                SowingForwardHandler._shared_background_task = None
+                SowingForwardHandler._shared_worker_owner = None
 
     async def _process_pending(self) -> None:
         if self.process_lock.locked():
             return
-
         async with self.process_lock:
-            matured = await self.state.get_matured(int(self.get_config("cache.wait_seconds", 600)))
-            if not matured:
-                return
-
-            last_forward_at = await self.state.get_last_forward_at()
-            cooldown_seconds = self._get_dynamic_cooldown()
-            if time.time() - last_forward_at < cooldown_seconds:
-                return
-
-            strategy = str(self.get_config("evaluation.strategy", "always"))
+            batch_size = int(self.get_config("processing.batch_size", 20))
+            self.llm_semaphore = asyncio.Semaphore(
+                max(1, int(self.get_config("processing.moderation_concurrency", 2)))
+            )
+            self.delivery_semaphore = asyncio.Semaphore(
+                max(1, int(self.get_config("processing.delivery_concurrency", 4)))
+            )
+            matured = await self.state.get_matured(batch_size)
+            strategy = str(self.get_config("evaluation.strategy", "keyword_llm"))
             keywords = self._normalize_list(self.get_config("evaluation.keywords", []))
             case_sensitive = bool(self.get_config("evaluation.case_sensitive", False))
+            maximum = int(self.get_config("processing.max_retries", 3))
+            delay = int(self.get_config("processing.retry_delay_seconds", 60))
+            async def evaluate_one(pending: PendingMessage) -> Tuple[PendingMessage, EvaluationResult]:
+                async with self.llm_semaphore:
+                    result = await MessageEvaluator.evaluate(
+                        strategy,
+                        pending,
+                        keywords,
+                        case_sensitive,
+                        self,
+                    )
+                return pending, result
 
-            for pending in matured:
-                evaluation = await MessageEvaluator.evaluate(
-                    strategy,
-                    pending,
-                    keywords,
-                    case_sensitive,
-                    self,
-                )
+            evaluation_results = await asyncio.gather(
+                *(evaluate_one(pending) for pending in matured[:batch_size])
+            )
+            for pending, evaluation in evaluation_results:
                 if not evaluation.is_final:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] deferred message {pending.message_id} because evaluation is incomplete: {evaluation.reason}"
-                    )
-                    return
+                    await self.state.retry_job(pending, evaluation.reason, delay, maximum)
+                    continue
                 if not evaluation.should_forward:
-                    await self.state.remove_pending(pending.message_id)
-                    logger.info(f"[{PLUGIN_NAME}] skipped message {pending.message_id}: {evaluation.reason}")
+                    await self.state.finalize_evaluation(pending, evaluation, [])
+                    logger.info(f"[{PLUGIN_NAME}] rejected {pending.message_id}: {evaluation.reason}")
                     continue
-
-                reply_payload: List[Tuple[ReplyContentType, str]] = []
-                for segment_type, content in pending.reply_segments:
-                    reply_type = self._to_reply_content(segment_type)
-                    if reply_type and content:
-                        reply_payload.append((reply_type, content))
-
-                target_stream_ids = self._exclude_source_stream(
-                    self._resolve_target_stream_ids(pending.platform),
-                    pending.platform,
-                    pending.group_id,
-                )
-                if not target_stream_ids:
-                    await self.state.remove_pending(pending.message_id)
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] no eligible target streams resolved for message {pending.message_id} after excluding source group"
-                    )
+                target_pairs: List[Tuple[str, str]] = []
+                configured_targets = self._resolve_target_group_ids()
+                if configured_targets:
+                    for group_id in configured_targets:
+                        if str(group_id) == pending.group_id:
+                            continue
+                        stream_id = ""
+                        stream = chat_api.get_stream_by_group_id(group_id, pending.platform)
+                        if stream:
+                            stream_id = str(chat_api.get_stream_info(stream).get("stream_id", "") or "")
+                        target_pairs.append((stream_id, str(group_id)))
+                else:
+                    for stream_id in self._exclude_source_stream(
+                        self._resolve_target_stream_ids(pending.platform),
+                        pending.platform,
+                        pending.group_id,
+                    ):
+                        group_id = self._group_id_for_stream(stream_id, pending.platform)
+                        if group_id:
+                            target_pairs.append((stream_id, group_id))
+                if not target_pairs:
+                    await self.state.retry_job(pending, "no target groups resolved", delay, maximum)
                     continue
+                await self.state.finalize_evaluation(pending, evaluation, target_pairs)
 
-                direct_forward_enabled = bool(self.get_config("napcat_http.use_direct_forward", False))
-                target_group_ids = [
-                    group_id for group_id in self._resolve_target_group_ids() if str(group_id) != str(pending.group_id)
-                ]
-                if direct_forward_enabled and not target_group_ids:
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] napcat direct forward requires explicit target.group_ids for message {pending.message_id}"
-                    )
+            deliveries = await self.state.due_deliveries(batch_size)
+            await asyncio.gather(*(self._deliver_one(delivery) for delivery in deliveries))
 
-                direct_success_count = 0
-                if direct_forward_enabled and target_group_ids:
-                    for target_group_id in target_group_ids:
-                        try:
-                            success = await self.napcat.forward_group_single_msg(target_group_id, pending.message_id)
-                        except Exception as exc:
-                            logger.error(
-                                f"[{PLUGIN_NAME}] napcat direct forward failed for message {pending.message_id} to group {target_group_id}: {exc}"
-                            )
-                            success = False
-                        if success:
-                            direct_success_count += 1
-
-                if direct_success_count > 0:
-                    await self.state.remove_pending(pending.message_id)
-                    await self.state.set_last_forward_at(time.time())
-                    logger.info(
-                        f"[{PLUGIN_NAME}] direct-forwarded message {pending.message_id} to {direct_success_count} target groups through NapCat HTTP"
-                    )
-                    return
-
-                # MaiBot 兜底:优先用 message_id 引用方式让 adapter 原样合并转发,失败再回退到手动构造节点。
-                # 引用合并消息的评论已经在 _extract_content_types 处被剔除,此处不会拿到 fake forward。
-                sender_id = pending.user_id or "0"
-                sender_name = pending.user_nickname or sender_id
-                id_reference_payload: List[Any] = [pending.message_id]
-                manual_payload: List[Any] = (
-                    [(sender_id, sender_name, reply_payload)] if reply_payload else []
+    async def _target_recent_texts(self, target_stream: str) -> List[str]:
+        if not target_stream or not bool(self.get_config("dedup.check_recent_messages", True)):
+            return []
+        try:
+            def load_recent_messages():
+                return message_api.get_recent_messages(
+                    chat_id=target_stream,
+                    hours=float(self.get_config("dedup.history_hours", 72)),
+                    limit=int(self.get_config("dedup.history_limit", 20)),
+                    limit_mode="latest",
+                    filter_mai=False,
                 )
 
-                async def _try_send(target_stream_id: str, payload: List[Any]) -> bool:
-                    try:
-                        return await self.send_forward(
-                            stream_id=target_stream_id,
-                            messages_list=payload,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            f"[{PLUGIN_NAME}] send_forward raised for message {pending.message_id} to stream {target_stream_id}: {exc}"
-                        )
-                        return False
+            messages = await asyncio.to_thread(load_recent_messages)
+        except Exception as exc:
+            logger.warning(f"[{PLUGIN_NAME}] failed to query recent target messages: {exc}")
+            return []
+        return [
+            str(getattr(item, "display_message", "") or getattr(item, "processed_plain_text", "") or "")
+            for item in messages or []
+        ]
 
-                success_count = 0
-                for target_stream_id in target_stream_ids:
-                    success = await _try_send(target_stream_id, id_reference_payload)
-                    if not success and manual_payload:
-                        success = await _try_send(target_stream_id, manual_payload)
-                    if success:
-                        success_count += 1
-                    else:
-                        logger.error(
-                            f"[{PLUGIN_NAME}] failed to forward message {pending.message_id} to stream {target_stream_id}"
-                        )
+    async def _deliver_one(self, delivery: Dict[str, Any]) -> None:
+        async with self.delivery_semaphore:
+            if not await self.state.claim_delivery(int(delivery["id"])):
+                return
+            target_key = str(delivery["target_group_id"] or delivery["target_stream_id"])
+            target_lock = self.target_locks.setdefault(target_key, asyncio.Lock())
+            async with target_lock:
+                await self._deliver_one_locked(delivery)
 
-                if success_count > 0:
-                    await self.state.remove_pending(pending.message_id)
-                    await self.state.set_last_forward_at(time.time())
-                    logger.info(
-                        f"[{PLUGIN_NAME}] forwarded message {pending.message_id} to {success_count} target streams"
-                    )
-                    return
-                # 全部转发失败,保留候选,等下一轮再试
-                continue
+    async def _deliver_one_locked(self, delivery: Dict[str, Any]) -> None:
+        pending = PendingMessage.from_dict(json.loads(delivery["payload_json"]))
+        target_stream = str(delivery["target_stream_id"])
+        fingerprint = str(delivery["fingerprint"])
+        dedup_target = target_stream or f"group:{delivery['target_group_id']}"
+        if await self.state.duplicate(dedup_target, fingerprint):
+            await self.state.complete_delivery(delivery["id"], "skipped_duplicate", pending, fingerprint)
+            return
+        threshold = float(self.get_config("dedup.similarity_threshold", 0.92))
+        history = await self.state.history(
+            dedup_target,
+            int(self.get_config("dedup.history_limit", 20)),
+        )
+        history.extend(await self._target_recent_texts(target_stream))
+        if any(content_similarity(pending.plain_text, item) >= threshold for item in history):
+            await self.state.complete_delivery(delivery["id"], "skipped_duplicate", pending, fingerprint)
+            return
+        cooldown_target = target_stream or f"group:{delivery['target_group_id']}"
+        cooldown_remaining = await self.state.cooling_remaining(
+            cooldown_target,
+            self._get_dynamic_cooldown(),
+        )
+        if cooldown_remaining > 0:
+            await self.state.defer_delivery(delivery["id"], cooldown_remaining)
+            return
+        success = False
+        if bool(self.get_config("napcat_http.use_direct_forward", True)) and self.napcat.is_enabled():
+            try:
+                success = await self.napcat.forward_group_single_msg(delivery["target_group_id"], pending.message_id)
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] NapCat target {delivery['target_group_id']} failed: {exc}")
+        if not success and target_stream:
+            try:
+                success = await self.send_forward(stream_id=target_stream, messages_list=[pending.message_id])
+            except Exception as exc:
+                logger.warning(f"[{PLUGIN_NAME}] MaiBot fallback target {target_stream} failed: {exc}")
+        if not success:
+            reason = "both send paths failed" if target_stream else "NapCat failed and target stream is unavailable"
+            await self.state.retry_delivery(
+                delivery["id"],
+                reason,
+                int(self.get_config("processing.retry_delay_seconds", 60)),
+                int(self.get_config("processing.max_retries", 3)),
+            )
+            return
+        analysis = json.loads(delivery["analysis_json"] or "{}")
+        summary = str(analysis.get("summary") or analysis.get("reason") or "")
+        await self.state.complete_delivery(
+            delivery["id"],
+            "sent",
+            pending,
+            fingerprint,
+            summary,
+        )
+        if not target_stream:
+            logger.info(
+                f"[{PLUGIN_NAME}] sent {pending.message_id} to group {delivery['target_group_id']}, "
+                "but no MaiBot stream exists for context recording"
+            )
+            return
+        if not bool(self.get_config("bot_context.enabled", True)):
+            return
+        try:
+            target_chat = get_chat_manager().get_stream(target_stream)
+            if target_chat is None:
+                raise RuntimeError(f"target stream {target_stream} is unavailable")
+            joke_points = [str(item) for item in analysis.get("joke_points", []) if str(item).strip()][:3]
+            content_tags = [str(item) for item in analysis.get("content_tags", []) if str(item).strip()][:5]
+            prompt_lines = [
+                "[搬运消息记录]",
+                f"你刚刚向当前群搬运了一条来自群 {pending.group_id} 的合并转发。",
+                f"内容概要：{summary or '未生成概要'}",
+            ]
+            if joke_points:
+                prompt_lines.append("可能的笑点：" + "；".join(joke_points))
+            if content_tags:
+                prompt_lines.append("内容标签：" + "、".join(content_tags))
+            saved = await database_api.store_action_info(
+                chat_stream=target_chat,
+                action_build_into_prompt=True,
+                action_prompt_display="\n".join(prompt_lines),
+                action_name="sowing_forward",
+                action_reasoning="记录插件搬运内容，供后续对话理解",
+                action_data={"source_group_id": pending.group_id, "source_message_id": pending.message_id, "summary": summary,
+                             "joke_points": analysis.get("joke_points", []),
+                             "content_tags": analysis.get("content_tags", []),
+                             "risk_tags": analysis.get("risk_tags", []), "fingerprint": fingerprint},
+            )
+            if not saved:
+                raise RuntimeError("database_api.store_action_info returned no record")
+        except Exception as exc:
+            logger.warning(
+                f"[{PLUGIN_NAME}] target {delivery['target_group_id']} was sent, "
+                f"but its ActionRecord could not be stored: {exc}"
+            )
+
+
+class SowingStartupHandler(SowingForwardHandler):
+    """启动时恢复 SQLite 中尚未完成的任务。"""
+    event_type = EventType.ON_START
+    handler_name = "sowing_startup_handler"
+    handler_description = "Restore persistent sowing worker."
+    intercept_message = False
+
+    async def execute(self, message: Any) -> Tuple[bool, bool, Optional[str], None, None]:
+        if self.get_config("plugin.enabled", False):
+            await self._ensure_background_worker()
+            logger.info(f"[{PLUGIN_NAME}] restored SQLite worker on startup")
+        return True, True, None, None, None
 
 
 @register_plugin
@@ -1023,7 +1361,11 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
         "plugin": "插件基础配置",
         "source": "源群配置：只有这些群的消息会进入候选池",
         "target": "目标群配置：命中的消息会被转发到这些群",
-        "cache": "缓存与等待窗口：消息会先缓存，等待贴表情统计稳定后再评估",
+        "cache": "缓存与等待窗口：收消息只解析并持久化 SQLite，worker 异步处理",
+        "processing": "有界后台处理和失败重试",
+        "dedup": "逐目标精确指纹与近期消息相似度去重",
+        "media": "复用 MaiBot 已有媒体描述，不触发额外 VLM",
+        "bot_context": "转发成功后写入 Bot 内部认知记录",
         "cooldown": "动态冷却配置：成功转发后进入冷却，避免连续播史",
         "filter": "消息过滤配置：控制哪些消息类型允许进入候选池",
         "evaluation": "评估策略配置：决定消息是否应该被转发",
@@ -1041,9 +1383,9 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.5.0",
-                description="配置文件版本。修改 config_schema 后应同步提升版本，便于 MaiBot 执行配置迁移。",
-                example="1.5.0",
+                default="2.0.0",
+                description="SQLite jobs/deliveries 架构版本；旧 runtime_state.json 不自动迁移。",
+                example="2.0.0",
             ),
         },
         "source": {
@@ -1068,7 +1410,7 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             "wait_seconds": ConfigField(
                 type=int,
                 default=600,
-                description="候选消息进入缓存后，需要等待多少秒才开始评估。表情统计需要时间沉淀，这个值过小会导致误判。",
+                description="候选消息进入缓存后，需要等待多少秒才开始评估。该窗口用于让聊天上下文沉淀，避免收到后立即搬运。",
                 min=1,
                 example="600",
             ),
@@ -1211,6 +1553,26 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
                 example="true",
             ),
         },
+        "processing": {
+            "batch_size": ConfigField(type=int, default=20, min=1, description="每轮最多处理的任务/投递数，避免无限 gather。", example="20"),
+            "moderation_concurrency": ConfigField(type=int, default=2, min=1, description="同时进行的审核任务上限。", example="2"),
+            "delivery_concurrency": ConfigField(type=int, default=4, min=1, description="同时进行的目标投递任务上限；同一目标群仍保持串行。", example="4"),
+            "max_retries": ConfigField(type=int, default=3, min=1, description="LLM 或发送暂时失败的最大重试次数。", example="3"),
+            "retry_delay_seconds": ConfigField(type=int, default=60, min=1, description="失败后的下一次重试延迟。", example="60"),
+        },
+        "dedup": {
+            "check_recent_messages": ConfigField(type=bool, default=True, description="发送前比对目标群真实近期消息，避免群友已发过的内容。", example="true"),
+            "history_hours": ConfigField(type=float, default=72.0, description="查询目标群近期消息的时间范围。", example="72"),
+            "history_limit": ConfigField(type=int, default=20, min=1, description="每目标群用于相似度比对的近期消息条数。", example="20"),
+            "record_retention_days": ConfigField(type=int, default=30, min=1, description="插件投递指纹的保留天数。", example="30"),
+            "similarity_threshold": ConfigField(type=float, default=0.92, description="规范化文本相似度阈值，达到后该目标标为 skipped_duplicate。", example="0.92"),
+        },
+        "media": {
+            "describe_picid": ConfigField(type=bool, default=True, description="仅复用已有 picid 描述；绝不调用新的 VLM，也不保存 base64/大 URL。", example="true"),
+        },
+        "bot_context": {
+            "enabled": ConfigField(type=bool, default=True, description="成功转发后写入 ActionRecord，让 Bot 知道自己搬运的内容、来源与笑点。", example="true"),
+        },
         "llm_review": {
             "enabled": ConfigField(
                 type=bool,
@@ -1233,9 +1595,9 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
             ),
             "expand_picid_descriptions": ConfigField(
                 type=bool,
-                default=False,
-                description="是否把消息里的 `[picid:xxx]` 替换为 MaiBot 数据库中已存在的图片描述。图片消息不再支持，默认关闭。",
-                example="false",
+                default=True,
+                description="兼容旧配置名；只查询 MaiBot 已有图片描述，不会触发新的 VLM 调用。",
+                example="true",
             ),
             "prompt_template": ConfigField(
                 type=str,
@@ -1263,12 +1625,13 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
                     "- 如果合并转发主要由图片占位符构成,且没有足够文字上下文证明节目效果,一律 reject。\n\n"
                     "## P2 合并转发放行标准\n"
                     "- allow:玩梗、抽象对话、低质段子、轻度冒犯但无实质风险、群友互动产生的明确节目效果。\n"
-                    "- allow:最近聊天记录能佐证该合并转发有上下文笑点。\n"
+                    "- allow:合并转发内容自成一体，脱离 Recent Chat History 仍能理解节目效果。\n"
+                    "- reject:内容强依赖原群上文，脱离上下文无法理解。\n"
                     "- reject:纯通知、纯求助、纯认真讨论、纯吵架骂战、纯客套、无上下文的普通聊天记录。\n"
                     "- reject:无法判断笑点或节目效果时一律 reject。\n\n"
                     "# Output\n"
                     "只输出一个 JSON 对象,不要输出任何额外文字:\n"
-                    "{\"decision\":\"allow|reject\",\"reason\":\"不超过40字\"}"
+                    '{"decision":"allow|reject","reason":"不超过40字","summary":"不超过200字的内容概要","joke_points":["最多3条可能笑点"],"context_dependency":"none|low|high","content_tags":["内容标签"],"risk_tags":["风险标签"]}'
                 ),
                 description="LLM 审核提示词模板。必须只要求模型输出 JSON,字段至少包含 decision 和 reason。占位符仅识别 {name} 形式,JSON 字面量花括号会被原样保留。",
                 example='{"decision":"allow","reason":"合并转发有节目效果"}',
@@ -1363,4 +1726,5 @@ class MaiBotSowingDiscordPlugin(BasePlugin):
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return [
             (SowingForwardHandler.get_handler_info(), SowingForwardHandler),
+            (SowingStartupHandler.get_handler_info(), SowingStartupHandler),
         ]
